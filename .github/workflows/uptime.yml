@@ -1,42 +1,130 @@
 name: Uptime
 
+# Each run checks the health endpoint every 5 minutes for about 45 minutes
+# and then starts the next run with workflow_dispatch, so the check runs
+# around the clock. GitHub drops most scheduled runs, so the cron line is
+# only a fallback that restarts the chain if it breaks.
 on:
   schedule:
     # Off the full hour, where GitHub delays scheduled runs the most.
     - cron: "8,23,38,53 * * * *"
   workflow_dispatch:
+    inputs:
+      failures:
+        description: Failed checks in a row carried over from the previous run
+        required: false
+        default: "0"
 
 permissions:
+  actions: write
   contents: read
+  issues: write
 
+# A new run waits until the current one is done. A newer pending run
+# replaces an older pending one, so at most one run waits.
 concurrency:
   group: uptime
   cancel-in-progress: false
 
+env:
+  ALARM_TITLE: "Uptime alarm: the health check is failing"
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   health:
-    name: Check /api/health
+    name: Check the health endpoint
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 58
     steps:
-      - name: Call the health endpoint up to 3 times
+      - name: Check every 5 minutes, alarm after 2 failures in a row
+        id: check
         env:
           HEALTH_URL: ${{ secrets.HEALTH_URL }}
+          CARRIED_FAILURES: ${{ inputs.failures || '0' }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           if [ -z "$HEALTH_URL" ]; then
             echo "::error::The HEALTH_URL secret is not set"
             exit 1
           fi
-          for attempt in 1 2 3; do
+          # 10# reads a value like 08 as decimal instead of octal.
+          if [[ "$CARRIED_FAILURES" =~ ^[0-9]{1,6}$ ]]; then
+            failures=$(( 10#$CARRIED_FAILURES ))
+          else
+            failures=0
+          fi
+          echo "$failures" > "$RUNNER_TEMP/failures"
+          # Set when the second failure in a row needs an alarm issue that
+          # could not be opened yet. It is retried at the next failure.
+          alarm_due=0
+
+          # Prints the number of the open alarm issue, or nothing. Fails when
+          # GitHub cannot list issues, so callers can tell that from no issue.
+          open_alarm() {
+            gh issue list --state open --limit 100 --json number,title \
+              --jq 'map(select(.title == env.ALARM_TITLE)) | .[0].number // empty'
+          }
+
+          for check in 1 2 3 4 5 6 7 8 9 10; do
+            target=$(( (check - 1) * 300 ))
+            if [ "$SECONDS" -lt "$target" ]; then
+              sleep $(( target - SECONDS ))
+            fi
+            now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            # Only 200 is healthy. A timeout or connection error gives 000.
             status=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$HEALTH_URL" || true)
-            if [ "${status:0:1}" = "2" ]; then
-              echo "OK: status $status on attempt $attempt"
+            if [ "$status" = "200" ]; then
+              failures=0
+              alarm_due=0
+              echo "$now check $check: OK"
+              if issue=$(open_alarm) && [ -n "$issue" ]; then
+                gh issue close "$issue" --comment "Recovered at $now: the health endpoint answers 200 again." \
+                  || echo "::warning::Could not close alarm issue #$issue"
+              fi
+            else
+              failures=$(( failures + 1 ))
+              echo "::warning::$now check $check: status $status, $failures failure(s) in a row"
+              # Alarm once per outage, so closing the issue by hand during an
+              # outage does not open a new one at every check.
+              if [ "$failures" -eq 2 ]; then
+                alarm_due=1
+              fi
+              if [ "$alarm_due" = 1 ]; then
+                if issue=$(open_alarm); then
+                  if [ -n "$issue" ]; then
+                    alarm_due=0
+                  elif gh issue create --title "$ALARM_TITLE" --body "@$OWNER The health endpoint failed $failures checks in a row. Last status $status at $now (000 means timeout or no connection). This issue closes itself when the endpoint answers 200 again."; then
+                    alarm_due=0
+                  else
+                    echo "::error::Could not open an alarm issue, retrying at the next check"
+                  fi
+                else
+                  echo "::error::Could not list issues, retrying the alarm at the next check"
+                fi
+              fi
+            fi
+            echo "$failures" > "$RUNNER_TEMP/failures"
+          done
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+          if [ "$failures" -ge 2 ]; then
+            echo "::error::The health endpoint is still failing"
+            exit 1
+          fi
+
+      - name: Start the next run
+        # Runs after an alarm too, but only when all checks ran, so a broken
+        # run cannot start runs in a fast loop. A cancelled run skips it.
+        if: ${{ !cancelled() && steps.check.outputs.completed == 'true' }}
+        run: |
+          failures=$(cat "$RUNNER_TEMP/failures" 2>/dev/null || echo 0)
+          for attempt in 1 2 3; do
+            if gh workflow run uptime.yml --ref "$GITHUB_REF_NAME" -f failures="$failures"; then
+              echo "Started the next run (carried failures: $failures)"
               exit 0
             fi
-            echo "Attempt $attempt failed with status $status"
-            if [ "$attempt" -lt 3 ]; then
-              sleep 30
-            fi
+            sleep 20
           done
-          echo "::error::The health endpoint failed 3 times in a row"
+          echo "::error::Could not start the next run. The cron line restarts the chain."
           exit 1
